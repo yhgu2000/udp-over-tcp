@@ -1,0 +1,26 @@
+# 与环境解耦
+env.cmake
+env.sh
+env.bat
+env.ps1
+tmp/
+dat/
+
+# VS Code
+.vscode/
+build/
+
+# Visual Studio
+.vs/
+out/
+CMakeSettings.json
+
+# Qt Creator
+**/*.user
+**/*.res
+**/*.autosave
+**/.qt_for_python/
+**/build-**/
+
+# Python
+**/__pycache__
