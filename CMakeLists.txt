@@ -12,15 +12,21 @@ endif()
 project(MyCpp VERSION 0.0.0.0)
 include(CTest) # CTest 需要在顶层包含
 
-# 安装导出目标名
-set(EXPORT_TARGETS ${PROJECT_NAME}Targets)
+# 语言标准
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
+# MSVC 配置
+add_compile_options("$<$<C_COMPILER_ID:MSVC>:/utf-8>")
+add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
 
 # 设置调试配置后缀
 set(CMAKE_DEBUG_POSTFIX ".d")
+# 安装导出目标名
+set(EXPORT_TARGETS ${PROJECT_NAME}Targets)
 
 # 项目自己的 CMake 模块包含路径
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR}/cmake)
-include(depend) # 引入项目依赖
+include(depend)
 include(code-coverage) # 覆盖率测试功能
 
 # 项目信息头文件
@@ -48,11 +54,11 @@ add_subdirectory(doc)
 add_subdirectory(test)
 
 #
-# 脚本
-#
-add_subdirectory(cmake)
-
-#
 # 示例
 #
 add_subdirectory(demo)
+
+#
+# 脚本
+#
+add_subdirectory(cmake)
