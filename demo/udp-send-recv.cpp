@@ -40,7 +40,6 @@ async_stdin(Executor& ex)
 /******************************************************************************/
 #define SERVER_BUFSIZE 10
 #define CLIENT_BUFSIZE 20
-#define CLIENT_INPUT_BUFSIZE 30
 /******************************************************************************/
 
 class Server
@@ -242,7 +241,8 @@ private:
 
   void do_send()
   {
-    mInput.async_read_some(mDynInputBuf.prepare(CLIENT_INPUT_BUFSIZE),
+    mInputBuf.resize(128);
+    mInput.async_read_some(Ba::buffer(mInputBuf),
                            [this](auto&& a, auto b) { on_send_1(a, b); });
   }
 
@@ -254,9 +254,11 @@ private:
     }
     std::cout << "client get " << len << " chars from input" << std::endl;
 
-    mDynInputBuf.commit(len);
+    mInputBuf.resize(len);
+    auto size = std::stoul(mInputBuf);
+    mData.resize(size);
     mSock.async_send_to(
-      mDynInputBuf.data(), mWho, [this](auto&& a, auto b) { on_send(a, b); });
+      Ba::buffer(mData), mWho, [this](auto&& a, auto b) { on_send(a, b); });
   }
 
   void on_send(const BoostEC& ec, std::size_t len)
@@ -267,7 +269,6 @@ private:
     }
     std::cout << "client send " << len << " bytes to " << mWho << std::endl;
 
-    mDynInputBuf.consume(len);
     do_send();
   }
 
@@ -278,8 +279,8 @@ private:
   decltype(Ba::dynamic_buffer(mBuf)) mDynBuf{ Ba::dynamic_buffer(mBuf) };
   Udp::endpoint mWho;
   AsyncStream mInput;
-  std::vector<std::uint8_t> mInputBuf;
-  decltype(mDynBuf) mDynInputBuf{ Ba::dynamic_buffer(mInputBuf) };
+  std::string mInputBuf;
+  std::vector<std::uint8_t> mData;
 };
 
 int
