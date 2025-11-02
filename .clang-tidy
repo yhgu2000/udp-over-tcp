@@ -7,17 +7,18 @@ Checks: "-*\
   ,concurrency-*\
   ,performance-*\
   ,portability-*\
-  ,readability-*\
   ,modernize-*\
+  ,-modernize-use-nodiscard\
+  ,-modernize-use-trailing-return-type\
+  ,-modernize-avoid-c-arrays
+  ,readability-*\
+  ,-readability-avoid-return-with-void-value\
   ,-readability-braces-around-statements\
   ,-readability-identifier-length\
-  ,-readability-magic-numbers\
-  ,-readability-redundant-access-specifiers\
   ,-readability-implicit-bool-conversion\
+  ,-readability-magic-numbers\
   ,-readability-qualified-auto\
-  ,-modernize-use-trailing-return-type\
-  ,-modernize-use-nodiscard\
-  ,-modernize-avoid-c-arrays"
+  ,-readability-redundant-access-specifiers"
   # TODO clang-tidy 在 17 版本后支持以列表形式书写，过两年就改进！
 
 CheckOptions:
