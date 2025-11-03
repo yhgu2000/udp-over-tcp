@@ -45,8 +45,6 @@ async_stdin(Executor& ex)
 #define CLIENT_BUFSIZE 1024
 /******************************************************************************/
 
-class Session;
-
 class Server
 {
 public:
@@ -142,25 +140,7 @@ private:
       on_accept(a, std::move(b));
     });
   }
-  void on_accept(const BoostEC& ec, Tcp::socket&& sock)
-  {
-    if (ec) {
-      if (ec != Ba::error::operation_aborted)
-        std::cerr << "accept failed: " << ec.message();
-      return;
-    }
-    come(std::move(sock));
-    do_accept();
-  }
-
-protected:
-  friend class Session;
-
-  std::unordered_set<std::shared_ptr<Session>> mSessions;
-  // 更适合使用链表, 并且应当侵入 Session 类
-
-  void come(Tcp::socket&& sock);
-  void over(Session& sess);
+  void on_accept(const BoostEC& ec, Tcp::socket&& sock);
 };
 
 class Session : public std::enable_shared_from_this<Session>
@@ -177,9 +157,9 @@ public:
     if (mRunning)
       return false;
     mRunning = true;
-    Ba::post(mSock.get_executor(), [this]() {
-      do_receive();
-      on_start();
+    Ba::post(mSock.get_executor(), [self = shared_from_this()] {
+      self->do_receive();
+      self->on_start();
     });
     return true;
   }
@@ -188,8 +168,8 @@ public:
   {
     if (!mRunning)
       return false;
-    Ba::post(mSock.get_executor(), [this]() {
-      mRunning = false; // 在下一个事务处理前会检查这个标志并中断处理
+    Ba::post(mSock.get_executor(), [self = shared_from_this()] {
+      self->mRunning = false; // 在下一个事务处理前会检查这个标志并中断处理
     });
     return true;
   }
@@ -222,7 +202,9 @@ private:
     }
 
     mSock.async_receive(mDynBuf.prepare(SERVER_BUFSIZE),
-                        [this](auto&& a, auto b) { on_receive_1(a, b); });
+                        [self = shared_from_this()](auto&& a, auto b) {
+                          self->on_receive_1(a, b);
+                        });
     // read_some 与 receive 语义完全相同, 只是为了满足多概念的要求而存在.
   }
   void on_receive_1(const BoostEC& ec, std::size_t len)
@@ -230,7 +212,6 @@ private:
     if (ec) {
       std::cerr << "session " << mSock.remote_endpoint()
                 << " receive failed: " << ec.message() << '\n';
-      mServer.over(*this);
       return;
     }
     std::cout << "session " << mSock.remote_endpoint() << " receive " << len
@@ -238,14 +219,15 @@ private:
 
     mDynBuf.commit(len);
     mSock.async_send(mDynBuf.data(),
-                     [this](auto&& a, auto b) { on_recieve(a, b); });
+                     [self = shared_from_this()](auto&& a, auto b) {
+                       self->on_recieve(a, b);
+                     });
   }
   void on_recieve(const BoostEC& ec, std::size_t len)
   {
     if (ec) {
       std::cerr << "session " << mSock.remote_endpoint()
                 << " send failed: " << ec.message() << '\n';
-      mServer.over(*this);
       return;
     }
     std::cout << "session " << mSock.remote_endpoint() << " send " << len
@@ -257,19 +239,17 @@ private:
 };
 
 void
-Server::come(Tcp::socket&& sock)
+Server::on_accept(const BoostEC& ec, Tcp::socket&& sock)
 {
+  if (ec) {
+    if (ec != Ba::error::operation_aborted)
+      std::cerr << "accept failed: " << ec.message();
+    return;
+  }
+
   auto sess = std::make_shared<Session>(*this, std::move(sock));
   sess->start();
-  mSessions.insert(std::move(sess));
-}
-
-void
-Server::over(Session& sess)
-{
-  // 也可以用 mutex 保护 mSessions 后把这个方法实现为同步的
-  Ba::post(mAcpt.get_executor(),
-           [&, this]() { mSessions.erase(sess.shared_from_this()); });
+  do_accept();
 }
 
 class Client
