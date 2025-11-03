@@ -13,6 +13,14 @@ target_link_libraries(demo.udp-send-recv PRIVATE Boost::system)
 
 
 #
+# TCP 收发示例
+#
+add_executable(demo.tcp-send-recv tcp-send-recv.cpp)
+
+target_link_libraries(demo.tcp-send-recv PRIVATE Boost::system)
+
+
+#
 # TCP 多线程传输示例
 #
 add_executable(demo.tcp-mt-trans tcp-mt-trans.cpp)
