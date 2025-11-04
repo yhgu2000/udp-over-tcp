@@ -29,6 +29,10 @@ const std::uint8_t kData[kBufferSize] = {};
 
 class Server;
 
+// Session 类的声明周期与会话生命周期相绑定: 类创建时会话就开始,
+// 类析构时会话就终止. 这种设计有好有坏: 好处是简单明了,
+// 坏处是会话终止后类中也许仍然保有有用的其它信息 (例如统计数据).
+// 其实会话终止后的 Session 对象性质也许就有点像僵尸进程.
 class Session
 {
 public:
@@ -44,12 +48,14 @@ public:
     });
   }
 
-  void close()
+  void delete_later(std::function<void(std::string)> cb = {})
   {
-    // 可以被 Session 之外的类调用, 暴力关闭会话.
+    // 可以被 Session 之外的类调用, 以暴力关闭会话.
     // 为了保证这个方法从 Session 之外调用是安全的, 需要用 post 让 Session
     // 所在的执行器去主动结束所有异步过程.
-    Ba::post(mSock.get_executor(), [this]() { do_close(); });
+    Ba::post(mSock.get_executor(),
+             [this, cb = std::move(cb)]() { cb ? cb(do_close()) : void(0); });
+    // 在多线程语境下, 一旦该方法返回, this 就应当被视为已经被无效化.
   }
 
   using Clock = std::chrono::steady_clock;
@@ -85,7 +91,7 @@ private:
 
   bool mGrace{ false };
 
-  void do_close();
+  std::string do_close();
 
   void do_send()
   {
@@ -95,21 +101,30 @@ private:
       mSock.shutdown(Tcp::socket::shutdown_send, ec);
       if (ec)
         std::cerr << "session " << mSock.remote_endpoint()
-                  << " shutdown failed: " << ec.message() << std::endl;
-      return do_close();
+                  << " shutdown failed: " << ec.message() << '\n';
+      auto err = do_close();
+      if (!err.empty())
+        std::cerr << err << '\n';
+      return;
     }
 
-    mSock.async_send(
-      Ba::buffer(kData), [this](const BoostEC& ec, std::size_t len) {
-        if (ec) {
-          std::cerr << "session " << mSock.remote_endpoint()
-                    << " send failed: " << ec.message() << std::endl;
-          return do_close();
-        }
+    mSock.async_send(Ba::buffer(kData),
+                     [this](const BoostEC& ec, std::size_t len) {
+                       if (ec) {
+                         if (ec == Ba::error::operation_aborted)
+                           return;
 
-        mAmountSent.fetch_add(len, std::memory_order_relaxed);
-        do_send();
-      });
+                         std::cerr << "session " << mSock.remote_endpoint()
+                                   << " send failed: " << ec.message() << '\n';
+                         auto err = do_close();
+                         if (!err.empty())
+                           std::cerr << err << '\n';
+                         return;
+                       }
+
+                       mAmountSent.fetch_add(len, std::memory_order_relaxed);
+                       do_send();
+                     });
   }
 
   void do_receive()
@@ -120,22 +135,29 @@ private:
         // send 和 receive 在更新活动时间的时机上有差别
 
         if (ec) {
+          if (ec == Ba::error::operation_aborted)
+            return;
+
           if (ec == Ba::error::eof) {
             BoostEC ec;
             mSock.shutdown(Tcp::socket::shutdown_receive, ec);
             if (ec) {
               std::cerr << "session " << mSock.remote_endpoint()
-                        << " shutdown receive failed: " << ec.message()
-                        << std::endl;
-              return do_close();
+                        << " shutdown receive failed: " << ec.message() << '\n';
+              auto err = do_close();
+              if (!err.empty())
+                std::cerr << err << '\n';
+              return;
             }
             mGrace = true;
             return;
           }
 
           std::cerr << "session " << mSock.remote_endpoint()
-                    << " receive failed: " << ec.message() << std::endl;
-          do_close();
+                    << " receive failed: " << ec.message() << '\n';
+          auto err = do_close();
+          if (!err.empty())
+            std::cerr << err << '\n';
           return;
         }
 
@@ -156,14 +178,18 @@ public:
 
   virtual ~Server() noexcept
   {
-    for (auto sess : mSessions) {
-    }
+    if (!mSessions.empty())
+      abort();
+    // 设计上, Session 对象的生命周期由 Server 管理.
+    // 如果 Server 析构时还有 Session 在工作, 则那些对象极有可能发生指针悬挂,
+    // 从而导致程序崩溃 -- 这种情况十分难于调试, 因此我们在这里杜绝它.
   }
 
   void start(const Tcp::endpoint& endpoint,
-             int backlog = Ba::socket_base::max_listen_connections)
+             int backlog = Ba::socket_base::max_listen_connections,
+             std::function<void(std::string)> cb = {})
   {
-    Ba::post(mAcpt.get_executor(), [=]() {
+    Ba::post(mAcpt.get_executor(), [=, cb = std::move(cb)]() {
       std::ostringstream errs;
       BoostEC ec;
 
@@ -193,21 +219,15 @@ public:
 
       do_accept();
     RETURN:
-      on_start(std::move(errs).str());
+      cb ? cb(std::move(errs).str()) : void(0);
     });
   }
 
-  void stop()
+  void stop(std::function<void(std::string)> cb = {})
   {
-    Ba::post(mAcpt.get_executor(), [=]() {
+    Ba::post(mAcpt.get_executor(), [=, cb = std::move(cb)]() mutable {
       std::ostringstream errs;
       BoostEC ec;
-
-      mAcpt.cancel(ec);
-      if (ec) {
-        errs << "cancel failed: " << ec.message();
-        goto RETURN;
-      }
 
       mAcpt.close(ec);
       if (ec) {
@@ -215,30 +235,33 @@ public:
         goto RETURN;
       }
 
+      { // 关闭所有会话后再调用 cb
+        struct Shared
+        {
+          std::function<void(std::string)> mCb;
+          std::size_t mCnt;
+          std::stringstream mErrs;
+          std::mutex mLock;
+        };
+        std::shared_ptr<Shared> shared(new Shared{
+          .mCb = std::move(cb),
+          .mCnt = mSessions.size(),
+        });
+
+        for (auto sess : mSessions)
+          sess->delete_later([shared](std::string err) {
+            std::scoped_lock lock(shared->mLock);
+            if (!err.empty())
+              shared->mErrs << err << '\n';
+            if (--shared->mCnt == 0 && shared->mCb)
+              shared->mCb(std::move(shared->mErrs).str());
+          });
+      }
+
+      return;
     RETURN:
-      on_stop(std::move(errs).str());
+      return cb ? cb(std::move(errs).str()) : void(0);
     });
-  }
-
-protected:
-  virtual void on_start(std::string err)
-  {
-    if (!err.empty()) {
-      std::cout << "server " << mAcpt.local_endpoint()
-                << " start failed: " << err << std::endl;
-      return;
-    }
-    std::cout << "server " << mAcpt.local_endpoint() << " started" << std::endl;
-  }
-
-  virtual void on_stop(std::string err)
-  {
-    if (!err.empty()) {
-      std::cout << "server " << mAcpt.local_endpoint()
-                << " stop failed: " << err << std::endl;
-      return;
-    }
-    std::cout << "server " << mAcpt.local_endpoint() << " stopped" << std::endl;
   }
 
 private:
@@ -290,17 +313,19 @@ protected:
   }
 };
 
-void
+std::string
 Session::do_close()
 {
+  std::stringstream errs;
   BoostEC ec;
   mSock.close(ec);
   if (ec)
-    std::cerr << "session " << mSock.remote_endpoint()
-              << " close failed: " << ec.message() << std::endl;
+    errs << "session " << mSock.remote_endpoint()
+         << " close failed: " << ec.message();
   // Session 的释放必须由 Server 完成, 由于 Server 工作在不同的执行器,
   // 同样必须用 post 让它自己去主动 over.
   Ba::post(mServer.mAcpt.get_executor(), [this]() { mServer.over(*this); });
+  return std::move(errs).str();
 }
 
 class Client
@@ -347,7 +372,7 @@ public:
       BoostEC ec;
       mSock.close(ec);
       if (ec) {
-        errs << "close failed: " << ec.message() << std::endl;
+        errs << "close failed: " << ec.message() << '\n';
         goto RETURN;
       }
     RETURN:
