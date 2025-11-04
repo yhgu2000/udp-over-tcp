@@ -6,6 +6,8 @@ Checks: "-*\
   ,clang-*\
   ,concurrency-*\
   ,performance-*\
+  ,-performance-avoid-endl\
+  ,-performance-unnecessary-value-param\
   ,portability-*\
   ,modernize-*\
   ,-modernize-use-nodiscard\
@@ -78,6 +80,12 @@ CheckOptions:
   - key: readability-identifier-naming.MemberPrefix
     value: m
   - key: readability-identifier-naming.MemberIgnoredRegexp
+    value: "^_|_$"
+  - key: readability-identifier-naming.ConstantMemberCase
+    value: CamelCase
+  - key: readability-identifier-naming.ConstantMemberPrefix
+    value: m
+  - key: readability-identifier-naming.ConstantMemberIgnoredRegexp
     value: "^_|_$"
 
   # Method

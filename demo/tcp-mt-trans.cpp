@@ -2,12 +2,16 @@
  * 基本示例：使用 Boost.Asio 多线程收发 TCP 数据                              *
  ******************************************************************************/
 
+#include <atomic>
 #include <boost/asio.hpp>
 #include <boost/system/result.hpp>
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 namespace Ba = boost::asio;
@@ -17,34 +21,124 @@ using BoostEC = boost::system::error_code;
 using Executor = Ba::any_io_executor;
 using Tcp = Ip::tcp;
 
-#ifdef _WIN32
-#include <boost/asio/windows/stream_handle.hpp>
-using AsyncStream = boost::asio::windows::stream_handle;
-
-inline AsyncStream
-async_stdin(Executor& ex)
-{
-  return { ex, GetStdHandle(STD_INPUT_HANDLE) };
-}
-
-#else
-
-#include <boost/asio/posix/stream_descriptor.hpp>
-using AsyncStream = boost::asio::posix::stream_descriptor;
-
-inline AsyncStream
-async_stdin(Executor& ex)
-{
-  return { ex, STDIN_FILENO };
-}
-#endif
-
 /******************************************************************************/
-#define SERVER_BUFSIZE 4096
-#define CLIENT_BUFSIZE 1024
+constexpr std::size_t kBufferSize = 65536;
 /******************************************************************************/
 
-class Session;
+const std::uint8_t kData[kBufferSize] = {};
+
+class Server;
+
+class Session
+{
+public:
+  Server& mServer;
+  Tcp::socket mSock;
+
+  Session(Server& server, Tcp::socket&& sock)
+    : mServer(server)
+    , mSock(std::move(sock))
+  {
+    Ba::post(mSock.get_executor(), [this]() {
+      do_send(), do_receive(); // 全双工收发
+    });
+  }
+
+  void close()
+  {
+    // 可以被 Session 之外的类调用, 暴力关闭会话.
+    // 为了保证这个方法从 Session 之外调用是安全的, 需要用 post 让 Session
+    // 所在的执行器去主动结束所有异步过程.
+    Ba::post(mSock.get_executor(), [this]() { do_close(); });
+  }
+
+  using Clock = std::chrono::steady_clock;
+
+  struct Statistics
+  {
+    Tcp::endpoint mRemoteEndpoint;
+    Clock::time_point mTimeEstablished;
+    Clock::time_point mTimeLastActive;
+    std::size_t mAmountSent;
+    std::size_t mAmountReceive;
+  };
+
+  Statistics statistics() const
+  {
+    return {
+      .mRemoteEndpoint = mRemoteEndpoint,
+      .mTimeEstablished = mTimeEstablished,
+      .mTimeLastActive = mTimeLastActive.load(std::memory_order_relaxed),
+      .mAmountSent = mAmountSent.load(std::memory_order_relaxed),
+      .mAmountReceive = mAmountReceive.load(std::memory_order_relaxed),
+    };
+  }
+
+private:
+  std::array<std::uint8_t, kBufferSize> mBuf;
+
+  const Tcp::endpoint mRemoteEndpoint{ mSock.remote_endpoint() };
+  const Clock::time_point mTimeEstablished{ Clock::now() };
+  std::atomic<Clock::time_point> mTimeLastActive;
+  std::atomic<std::size_t> mAmountSent;
+  std::atomic<std::size_t> mAmountReceive;
+
+  bool mOver{ false };
+
+  void do_close();
+
+  void do_send()
+  {
+    mTimeLastActive.store(Clock::now(), std::memory_order_relaxed);
+    if (mOver) {
+      BoostEC ec;
+      mSock.shutdown(Tcp::socket::shutdown_send, ec);
+      if (ec)
+        std::cerr << "session " << mSock.remote_endpoint()
+                  << " shutdown failed: " << ec.message() << std::endl;
+      return do_close();
+    }
+
+    mSock.async_send(
+      Ba::buffer(kData), [this](const BoostEC& ec, std::size_t len) {
+        if (ec) {
+          std::cerr << "session " << mSock.remote_endpoint()
+                    << " send failed: " << ec.message() << std::endl;
+          return do_close();
+        }
+        mAmountSent.fetch_add(len, std::memory_order_relaxed);
+        do_send();
+      });
+  }
+
+  void do_receive()
+  {
+    mSock.async_receive(
+      Ba::buffer(mBuf), [this](const BoostEC& ec, std::size_t len) {
+        mTimeLastActive.store(Clock::now(), std::memory_order_relaxed);
+        // send 和 receive 在更新活动时间的时机上有差别
+
+        if (ec) {
+          if (ec == Ba::error::eof) {
+            BoostEC ec;
+            mSock.shutdown(Tcp::socket::shutdown_receive, ec);
+            if (ec)
+              std::cerr << "session " << mSock.remote_endpoint()
+                        << " shutdown receive failed: " << ec.message()
+                        << std::endl;
+          } else
+            std::cerr << "session " << mSock.remote_endpoint()
+                      << " receive failed: " << ec.message() << std::endl;
+
+          mOver = true;
+          return; // 总是让 send 异步过程优雅关闭连接
+                  // 不能调用 close 因为只能在 send 中调用一次!
+        }
+        mAmountReceive.fetch_add(len, std::memory_order_relaxed);
+        do_receive();
+      });
+  }
+};
 
 class Server
 {
@@ -55,80 +149,91 @@ public:
   {
   }
 
-  virtual ~Server() = default;
-
-  // 所有 cb 参数都可以转换为带默认实现的虚函数，start stop
-  // 都是在各种所属的 strand 中异步地执行。
-
-  bool start(const Tcp::endpoint& endpoint,
-             int backlog = Ba::socket_base::max_listen_connections,
-             std::function<void(BoostEC&&)> cb = {})
+  virtual ~Server() noexcept
   {
-    // 这种写法不能避免重复 start 时 on_start 被多次触发,
-    // 而且会使方法变得线程不安全, 让多线程在 mAcpt 上竞争.
-    if (mAcpt.is_open())
-      return false;
-
-    Ba::post(mAcpt.get_executor(),
-             [this, cb = std::move(cb), endpoint, backlog]() {
-               BoostEC ec;
-               mAcpt.open(endpoint.protocol(), ec);
-               if (ec) {
-                 std::cerr << "open failed: " << ec.message();
-                 goto RETURN;
-               }
-
-               mAcpt.set_option(Ba::socket_base::reuse_address(true), ec);
-               if (ec) {
-                 std::cerr << "set_option failed: " << ec.message();
-                 goto RETURN;
-               }
-
-               mAcpt.bind(endpoint, ec);
-               if (ec) {
-                 std::cerr << "bind failed: " << ec.message();
-                 goto RETURN;
-               }
-
-               mAcpt.listen(backlog, ec);
-               if (ec) {
-                 std::cerr << "listen failed: " << ec.message();
-                 goto RETURN;
-               }
-
-               do_accept();
-             RETURN:
-               cb ? cb(std::move(ec)) : (void)0;
-             });
-    return true;
+    for (auto sess : mSessions) {
+    }
   }
 
-  // start 和 stop 都异步，但不线程安全
-
-  bool stop(std::function<void(BoostEC&& ec)> cb)
+  void start(const Tcp::endpoint& endpoint,
+             int backlog = Ba::socket_base::max_listen_connections)
   {
-    if (!mAcpt.is_open())
-      return false;
+    Ba::post(mAcpt.get_executor(), [=]() {
+      std::ostringstream errs;
+      BoostEC ec;
 
-    Ba::post(mAcpt.get_executor(), [this, cb = std::move(cb)]() {
+      mAcpt.open(endpoint.protocol(), ec);
+      if (ec) {
+        errs << "open failed: " << ec.message();
+        goto RETURN;
+      };
+
+      mAcpt.set_option(Ba::socket_base::reuse_address(true), ec);
+      if (ec) {
+        errs << "set_option failed: " << ec.message();
+        goto RETURN;
+      }
+
+      mAcpt.bind(endpoint, ec);
+      if (ec) {
+        errs << "bind failed: " << ec.message();
+        goto RETURN;
+      }
+
+      mAcpt.listen(backlog, ec);
+      if (ec) {
+        errs << "listen failed: " << ec.message();
+        goto RETURN;
+      }
+
+      do_accept();
+    RETURN:
+      on_start(std::move(errs).str());
+    });
+  }
+
+  void stop()
+  {
+    Ba::post(mAcpt.get_executor(), [=]() {
+      std::ostringstream errs;
       BoostEC ec;
 
       mAcpt.cancel(ec);
       if (ec) {
-        std::cerr << "cancel failed: " << ec.message();
+        errs << "cancel failed: " << ec.message();
         goto RETURN;
       }
 
       mAcpt.close(ec);
       if (ec) {
-        std::cerr << "close failed: " << ec.message();
+        errs << "close failed: " << ec.message();
         goto RETURN;
       }
 
     RETURN:
-      cb ? cb(std::move(ec)) : (void)0;
+      on_stop(std::move(errs).str());
     });
-    return true;
+  }
+
+protected:
+  virtual void on_start(std::string err)
+  {
+    if (!err.empty()) {
+      std::cout << "server " << mAcpt.local_endpoint()
+                << " start failed: " << err << std::endl;
+      return;
+    }
+    std::cout << "server " << mAcpt.local_endpoint() << " started" << std::endl;
+  }
+
+  virtual void on_stop(std::string err)
+  {
+    if (!err.empty()) {
+      std::cout << "server " << mAcpt.local_endpoint()
+                << " stop failed: " << err << std::endl;
+      return;
+    }
+    std::cout << "server " << mAcpt.local_endpoint() << " stopped" << std::endl;
   }
 
 private:
@@ -137,290 +242,175 @@ private:
 
   void do_accept()
   {
-    mAcpt.async_accept(Ba::make_strand(mEx), [this](auto&& a, auto b) {
-      on_accept(a, std::move(b));
-    });
+    auto _on_accept = [this](const BoostEC& ec, Tcp::socket&& sock) {
+      if (ec) {
+        if (ec != Ba::error::operation_aborted)
+          std::cerr << "server " << mAcpt.local_endpoint()
+                    << " accept failed: " << ec.message();
+        return;
+      }
+      come(std::move(sock));
+      do_accept();
+    };
+    mAcpt.async_accept(Ba::make_strand(mEx), std::move(_on_accept));
   }
-  void on_accept(const BoostEC& ec, Tcp::socket&& sock)
+
+public:
+  void audit(std::function<void(const std::unordered_set<Session*>&)> cb)
   {
-    if (ec) {
-      if (ec != Ba::error::operation_aborted)
-        std::cerr << "accept failed: " << ec.message();
-      return;
-    }
-    come(std::move(sock));
-    do_accept();
+    Ba::post(mAcpt.get_executor(),
+             [this, cb = std::move(cb)]() { cb(mSessions); });
   }
 
 protected:
   friend class Session;
 
-  std::unordered_set<std::shared_ptr<Session>> mSessions;
-  // 更适合使用链表, 并且应当侵入 Session 类
+  std::unordered_set<Session*> mSessions;
+  // 更适合使用侵入 Session 类的链表数据结构
 
-  void come(Tcp::socket&& sock);
-  void over(Session& sess);
-};
-
-class Session : public std::enable_shared_from_this<Session>
-{
-public:
-  Session(Server& server, Tcp::socket&& sock)
-    : mServer(server)
-    , mSock(std::move(sock))
+  virtual void come(Tcp::socket&& sock)
   {
+    std::cout << "session " << sock.remote_endpoint() << " come" << std::endl;
+    auto sess = new Session(*this, std::move(sock));
+    mSessions.insert(sess);
   }
 
-  bool start()
+  virtual void over(Session& sess)
   {
-    if (mRunning)
-      return false;
-    mRunning = true;
-    Ba::post(mSock.get_executor(), [this]() {
-      do_receive();
-      on_start();
-    });
-    return true;
-  }
-
-  bool stop()
-  {
-    if (!mRunning)
-      return false;
-    Ba::post(mSock.get_executor(), [this]() {
-      mRunning = false; // 在下一个事务处理前会检查这个标志并中断处理
-    });
-    return true;
-  }
-
-protected:
-  virtual void on_start()
-  {
-    std::cout << "session " << mSock.remote_endpoint() << " started "
+    std::cout << "session " << sess.mSock.remote_endpoint() << " over"
               << std::endl;
-  }
-
-  virtual void on_stop()
-  {
-    std::cout << "session " << mSock.remote_endpoint() << " stopped "
-              << std::endl;
-  }
-
-private:
-  Server& mServer;
-  Tcp::socket mSock;
-  bool mRunning{ false };
-  std::vector<std::uint8_t> mBuf;
-  decltype(Ba::dynamic_buffer(mBuf)) mDynBuf{ Ba::dynamic_buffer(mBuf) };
-
-  void do_receive()
-  {
-    if (!mRunning) {
-      on_stop();
-      return;
-    }
-
-    mSock.async_receive(mDynBuf.prepare(SERVER_BUFSIZE),
-                        [this](auto&& a, auto b) { on_receive_1(a, b); });
-    // read_some 与 receive 语义完全相同, 只是为了满足多概念的要求而存在.
-  }
-  void on_receive_1(const BoostEC& ec, std::size_t len)
-  {
-    if (ec) {
-      std::cerr << "session " << mSock.remote_endpoint()
-                << " receive failed: " << ec.message() << '\n';
-      mServer.over(*this);
-      return;
-    }
-    std::cout << "session " << mSock.remote_endpoint() << " receive " << len
-              << " bytes" << std::endl;
-
-    mDynBuf.commit(len);
-    mSock.async_send(mDynBuf.data(),
-                     [this](auto&& a, auto b) { on_recieve(a, b); });
-  }
-  void on_recieve(const BoostEC& ec, std::size_t len)
-  {
-    if (ec) {
-      std::cerr << "session " << mSock.remote_endpoint()
-                << " send failed: " << ec.message() << '\n';
-      mServer.over(*this);
-      return;
-    }
-    std::cout << "session " << mSock.remote_endpoint() << " send " << len
-              << " bytes" << std::endl;
-
-    mDynBuf.consume(len);
-    do_receive();
+    mSessions.erase(&sess);
+    delete &sess; // 构造-析构匹配原则:
+                  // Server new 的 Session, 就由 Server 去 delete
   }
 };
 
 void
-Server::come(Tcp::socket&& sock)
+Session::do_close()
 {
-  auto sess = std::make_shared<Session>(*this, std::move(sock));
-  sess->start();
-  mSessions.insert(std::move(sess));
-}
-
-void
-Server::over(Session& sess)
-{
-  // 也可以用 mutex 保护 mSessions 后把这个方法实现为同步的
-  Ba::post(mAcpt.get_executor(),
-           [&, this]() { mSessions.erase(sess.shared_from_this()); });
+  BoostEC ec;
+  mSock.close(ec);
+  if (ec)
+    std::cerr << "session " << mSock.remote_endpoint()
+              << " close failed: " << ec.message() << std::endl;
+  // Session 的释放必须由 Server 完成, 由于 Server 工作在不同的执行器,
+  // 同样必须用 post 让它自己去主动 over.
+  Ba::post(mServer.mAcpt.get_executor(), [this]() { mServer.over(*this); });
 }
 
 class Client
 {
 public:
   Client(Executor ex)
-    : mEx(std::move(ex))
-    , mSock(mEx)
-    , mInput(async_stdin(mEx))
+    : mSock(Ba::make_strand(ex))
   {
   }
 
-  // Client 的这种 start stop 最好 (异步+虚方法回调+线程安全)
-
   void start(Tcp::endpoint ep)
   {
+    static constexpr auto _on_connect = [](Client& self, const BoostEC& ec) {
+      std::stringstream errs;
+      if (ec) {
+        errs << "connect failed: " << ec.message();
+        goto RETURN;
+      }
+      self.do_send(), self.do_receive();
+    RETURN:
+      self.on_start(std::move(errs).str());
+    };
+
     Ba::post(mSock.get_executor(), [this, ep = std::move(ep)]() {
+      std::stringstream errs;
       BoostEC ec;
       mSock.open(ep.protocol(), ec);
-      if (ec)
-        return on_start(ec);
-      mSock.async_connect(ep, [this](auto&& a) { on_start_1(a); });
+      if (ec) {
+        errs << "open failed: " << ec.message();
+        goto RETURN;
+      }
+      mSock.async_connect(
+        ep, [this](const BoostEC& ec) { _on_connect(*this, ec); });
+      return;
+    RETURN:
+      on_start(std::move(errs).str());
     });
   }
 
   void stop()
   {
     Ba::post(mSock.get_executor(), [this]() {
+      std::stringstream errs;
       BoostEC ec;
-      mSock.cancel(ec);
-      if (ec)
-        std::cerr << "client cancel failed: " << ec.message() << '\n';
       mSock.close(ec);
-      if (ec)
-        std::cerr << "client close failed: " << ec.message() << '\n';
+      if (ec) {
+        errs << "close failed: " << ec.message() << std::endl;
+        goto RETURN;
+      }
+    RETURN:
+      on_stop(std::move(errs).str());
     });
   }
 
+  void over() {}
+
 protected:
-  virtual void on_start(const BoostEC& ec)
+  virtual void on_start(std::string err)
   {
     if (ec) {
-      std::cerr << "client connect failed: " << ec.message() << '\n';
+      std::cerr << "client connect failed: " << ec.message() << std::endl;
       return;
     }
-    std::cout << "client " << mSock.local_endpoint() << " started "
-              << std::endl;
+    std::cout << "client " << mSock.local_endpoint() << " started" << std::endl;
   }
 
-  virtual void on_stop(const BoostEC& ec)
-  {
-    std::cout << "client " << mSock.local_endpoint() << " stopped "
-              << std::endl;
-  }
-
-private:
-  void on_start_1(const BoostEC& ec)
-  {
-    if (ec)
-      return on_start(ec);
-    do_send(), do_receive(); // （异步）同时收发
-    on_start(ec);
-  }
-
-private:
-  void do_receive()
-  {
-    mSock.async_receive(mDynBuf.prepare(CLIENT_BUFSIZE),
-                        [this](auto&& a, auto b) { on_receive(a, b); });
-  }
-
-  void on_receive(const BoostEC& ec, std::size_t len)
+  virtual void on_stop(std::string err)
   {
     if (ec) {
-      std::cerr << "client receive failed: " << ec.message() << '\n';
-      return stop();
+      std::cerr << "client connect failed: " << ec.message() << std::endl;
+      return;
     }
-
-    mDynBuf.commit(len);
-
-    bool allZero = true;
-    auto data = mDynBuf.data();
-    for (auto i = reinterpret_cast<const std::uint8_t*>(data.data()),
-              iE = i + data.size();
-         i < iE;
-         ++i) {
-      if (*i != 0) {
-        allZero = false;
-        break;
-      }
-    }
-
-    std::cout << "client recieve " << len << " bytes"
-              << (allZero ? "" : "(check failed)") << std::endl;
-
-    mDynBuf.consume(len);
-    do_receive();
+    std::cout << "client " << mSock.local_endpoint() << " stopped" << std::endl;
   }
+
+private:
+  Tcp::socket mSock;
+  std::array<std::uint8_t, kBufferSize> mBuf;
 
   void do_send()
   {
-    mInputBuf.resize(128);
-    mInput.async_read_some(Ba::buffer(mInputBuf),
-                           [this](auto&& a, auto b) { on_send_1(a, b); });
+    mSock.async_send(
+      Ba::buffer(kData), [this](const BoostEC& ec, std::size_t len) {
+        if (ec) {
+          std::cerr << "session " << mSock.remote_endpoint()
+                    << " send failed: " << ec.message() << std::endl;
+          return stop();
+        }
+        do_send();
+      });
   }
 
-  void on_send_1(const BoostEC& ec, std::size_t len)
+  void do_receive()
   {
-    if (ec) {
-      std::cerr << "client read failed: " << ec.message() << '\n';
-      return;
-    }
-    std::cout << "client get " << len << " chars from input" << std::endl;
-
-    mInputBuf.resize(len);
-    auto size = std::stoul(mInputBuf);
-    mData.resize(size);
-    mSock.async_send(Ba::buffer(mData),
-                     [this](auto&& a, auto b) { on_send(a, b); });
+    mSock.async_receive(
+      Ba::buffer(mBuf), [this](const BoostEC& ec, std::size_t len) {
+        if (ec) {
+          std::cerr << "session " << mSock.remote_endpoint()
+                    << " receive failed: " << ec.message() << std::endl;
+          return stop();
+        }
+        do_receive();
+      });
   }
-
-  void on_send(const BoostEC& ec, std::size_t len)
-  {
-    if (ec) {
-      std::cerr << "client send failed: " << ec.message() << '\n';
-      return;
-    }
-    std::cout << "client send " << len << " bytes" << std::endl;
-
-    do_send();
-  }
-
-private:
-  Executor mEx;
-  Tcp::socket mSock;
-  std::vector<std::uint8_t> mBuf;
-  decltype(Ba::dynamic_buffer(mBuf)) mDynBuf{ Ba::dynamic_buffer(mBuf) };
-  AsyncStream mInput;
-  std::string mInputBuf;
-  std::vector<std::uint8_t> mData;
 };
 
 int
 main()
 {
   Ba::io_context ioctx;
-  // TODO 改成多线程的
 
   Ba::signal_set grace(ioctx, SIGINT, SIGTERM);
   grace.async_wait([&ioctx](const BoostEC& ec, int signum) {
     if (ec) {
-      std::cerr << "signal failed: " << ec.message() << '\n';
+      std::cout << "signal failed: " << ec.message() << std::endl;
       return;
     }
 
@@ -438,5 +428,9 @@ main()
   Client client(ioctx.get_executor());
   client.start({ localhost, 12345 });
 
-  ioctx.run();
+  std::vector<std::thread> threads(std::thread::hardware_concurrency());
+  for (auto& thread : threads)
+    thread = std::thread([&]() { ioctx.run(); });
+  for (auto& thread : threads)
+    thread.join();
 }
