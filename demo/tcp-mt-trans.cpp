@@ -83,14 +83,14 @@ private:
   std::atomic<std::size_t> mAmountSent;
   std::atomic<std::size_t> mAmountReceive;
 
-  bool mOver{ false };
+  bool mGrace{ false };
 
   void do_close();
 
   void do_send()
   {
     mTimeLastActive.store(Clock::now(), std::memory_order_relaxed);
-    if (mOver) {
+    if (mGrace) {
       BoostEC ec;
       mSock.shutdown(Tcp::socket::shutdown_send, ec);
       if (ec)
@@ -106,6 +106,7 @@ private:
                     << " send failed: " << ec.message() << std::endl;
           return do_close();
         }
+
         mAmountSent.fetch_add(len, std::memory_order_relaxed);
         do_send();
       });
@@ -122,18 +123,22 @@ private:
           if (ec == Ba::error::eof) {
             BoostEC ec;
             mSock.shutdown(Tcp::socket::shutdown_receive, ec);
-            if (ec)
+            if (ec) {
               std::cerr << "session " << mSock.remote_endpoint()
                         << " shutdown receive failed: " << ec.message()
                         << std::endl;
-          } else
-            std::cerr << "session " << mSock.remote_endpoint()
-                      << " receive failed: " << ec.message() << std::endl;
+              return do_close();
+            }
+            mGrace = true;
+            return;
+          }
 
-          mOver = true;
-          return; // 总是让 send 异步过程优雅关闭连接
-                  // 不能调用 close 因为只能在 send 中调用一次!
+          std::cerr << "session " << mSock.remote_endpoint()
+                    << " receive failed: " << ec.message() << std::endl;
+          do_close();
+          return;
         }
+
         mAmountReceive.fetch_add(len, std::memory_order_relaxed);
         do_receive();
       });
