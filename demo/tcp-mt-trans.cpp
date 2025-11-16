@@ -149,7 +149,7 @@ private:
                 std::cerr << err << '\n';
               return;
             }
-            mGrace = true;
+            mGrace = true; // 让发送协程优雅关闭
             return;
           }
 
@@ -331,43 +331,43 @@ Session::do_close()
 class Client
 {
 public:
+  Tcp::socket mSock;
+
   Client(Executor ex)
     : mSock(Ba::make_strand(ex))
   {
   }
 
-  void start(Tcp::endpoint ep)
+  void start(Tcp::endpoint ep, std::function<void(std::string)> cb = {})
   {
-    static constexpr auto _on_connect = [](Client& self, const BoostEC& ec) {
-      std::stringstream errs;
-      if (ec) {
-        errs << "connect failed: " << ec.message();
-        goto RETURN;
-      }
-      self.do_send(), self.do_receive();
-    RETURN:
-      self.on_start(std::move(errs).str());
-    };
+    Ba::post(mSock.get_executor(),
+             [this, ep = std::move(ep), cb = std::move(cb)]() mutable {
+               std::stringstream errs;
+               BoostEC ec;
+               mSock.open(ep.protocol(), ec);
+               if (ec) {
+                 errs << "open failed: " << ec.message();
+                 cb ? cb(std::move(errs).str()) : void(0);
+                 return;
+               }
 
-    Ba::post(mSock.get_executor(), [this, ep = std::move(ep)]() {
-      std::stringstream errs;
-      BoostEC ec;
-      mSock.open(ep.protocol(), ec);
-      if (ec) {
-        errs << "open failed: " << ec.message();
-        goto RETURN;
-      }
-      mSock.async_connect(
-        ep, [this](const BoostEC& ec) { _on_connect(*this, ec); });
-      return;
-    RETURN:
-      on_start(std::move(errs).str());
-    });
+               mSock.async_connect(
+                 ep, [this, cb = std::move(cb)](const BoostEC& ec) {
+                   std::stringstream errs;
+                   if (ec) {
+                     errs << "connect failed: " << ec.message();
+                     goto RETURN;
+                   }
+                   do_send(), do_receive();
+                 RETURN:
+                   cb ? cb(std::move(errs).str()) : void(0);
+                 });
+             });
   }
 
-  void stop()
+  void stop(std::function<void(std::string)> cb = {})
   {
-    Ba::post(mSock.get_executor(), [this]() {
+    Ba::post(mSock.get_executor(), [this, cb = std::move(cb)]() {
       std::stringstream errs;
       BoostEC ec;
       mSock.close(ec);
@@ -376,40 +376,38 @@ public:
         goto RETURN;
       }
     RETURN:
-      on_stop(std::move(errs).str());
+      cb ? cb(std::move(errs).str()) : void(0);
     });
   }
 
-  void over() {}
-
-protected:
-  virtual void on_start(std::string err)
+  void over(std::function<void(std::string)> cb = [](std::string) {})
   {
-    if (ec) {
-      std::cerr << "client connect failed: " << ec.message() << std::endl;
-      return;
-    }
-    std::cout << "client " << mSock.local_endpoint() << " started" << std::endl;
-  }
-
-  virtual void on_stop(std::string err)
-  {
-    if (ec) {
-      std::cerr << "client connect failed: " << ec.message() << std::endl;
-      return;
-    }
-    std::cout << "client " << mSock.local_endpoint() << " stopped" << std::endl;
+    Ba::post(mSock.get_executor(), [this, cb = std::move(cb)]() mutable {
+      if (mGraceCb) {
+        cb("already cancelling");
+        return;
+      }
+      mGraceCb = std::move(cb);
+    });
   }
 
 private:
-  Tcp::socket mSock;
   std::array<std::uint8_t, kBufferSize> mBuf;
+
+  std::function<void(std::string)> mGraceCb;
 
   void do_send()
   {
+    if (mGraceCb) {
+      mSock.shutdown(Tcp::socket::shutdown_send);
+      return;
+    }
+
     mSock.async_send(
       Ba::buffer(kData), [this](const BoostEC& ec, std::size_t len) {
         if (ec) {
+          if (ec == Ba::error::operation_aborted)
+            return;
           std::cerr << "session " << mSock.remote_endpoint()
                     << " send failed: " << ec.message() << std::endl;
           return stop();
@@ -423,6 +421,19 @@ private:
     mSock.async_receive(
       Ba::buffer(mBuf), [this](const BoostEC& ec, std::size_t len) {
         if (ec) {
+          if (ec == Ba::error::operation_aborted)
+            return;
+          if (ec == Ba::error::eof) {
+            BoostEC ec;
+            mSock.shutdown(Tcp::socket::shutdown_receive, ec);
+            if (ec) {
+              std::cerr << "client " << this
+                        << " shutdown recieve failed: " << ec.message()
+                        << std::endl;
+            }
+            mSock.close(ec);
+            mGraceCb ? mGraceCb(ec ? ec.message() : "") : void(0);
+          }
           std::cerr << "session " << mSock.remote_endpoint()
                     << " receive failed: " << ec.message() << std::endl;
           return stop();
@@ -437,30 +448,78 @@ main()
 {
   Ba::io_context ioctx;
 
-  Ba::signal_set grace(ioctx, SIGINT, SIGTERM);
-  grace.async_wait([&ioctx](const BoostEC& ec, int signum) {
-    if (ec) {
-      std::cout << "signal failed: " << ec.message() << std::endl;
-      return;
-    }
-
-    std::cout << "quit by signal " << signum << std::endl;
-    ioctx.stop();
-  });
-
-  auto localhost = Ip::address_v4::from_string("127.0.0.1");
+  auto localhost = Ip::address_v4::from_string("127.0.0.100");
 
   Server server(ioctx.get_executor());
-  server.start({ Tcp::v4(), 12345 }, 4096, [](BoostEC&& ec) {
-    std::cout << "server start failed: " << ec.message() << std::endl;
+  server.start({ Tcp::v4(), 12345 }, 4096, [](std::string err) {
+    if (!err.empty())
+      std::cout << "server start failed: " << err << std::endl;
   });
-
-  Client client(ioctx.get_executor());
-  client.start({ localhost, 12345 });
 
   std::vector<std::thread> threads(std::thread::hardware_concurrency());
   for (auto& thread : threads)
     thread = std::thread([&]() { ioctx.run(); });
+
+  std::vector<Client> clients;
+  while (true) {
+    std::string line;
+    std::cin >> line;
+    if (line.empty())
+      break;
+
+    if (line == "s") {
+      server.audit([](const std::unordered_set<Session*>& sessions) {
+        for (auto sess : sessions) {
+          auto stat = sess->statistics();
+          std::cout << stat.mRemoteEndpoint //
+                    << ":\n  TimeEstablished = "
+                    << stat.mTimeEstablished.time_since_epoch().count() //
+                    << "\n  TimeLastActive = "
+                    << stat.mTimeLastActive.time_since_epoch().count()
+                    << "\n  AmountReceive = " << stat.mAmountReceive //
+                    << "\n  AmountSent = " << stat.mAmountSent       //
+                    << std::endl;
+        }
+      });
+    }
+
+    else if (line == "n") {
+      auto& client = clients.emplace_back(ioctx.get_executor());
+      client.start({ localhost, 12345 }, [&](std::string err) {
+        if (!err.empty()) {
+          std::cout << "client connect failed: " << err << std::endl;
+          return;
+        }
+        std::cout << "client " << client.mSock.local_endpoint() << " started"
+                  << std::endl;
+      });
+    }
+
+    else if (line == "d") {
+      for (auto it = clients.rbegin(), itEnd = clients.rend(); it != itEnd;
+           ++it) {
+        if (it->mSock.is_open())
+          break;
+        clients.pop_back();
+      }
+
+      auto& client = clients.back();
+      client.stop([&](std::string err) {
+        if (!err.empty()) {
+          std::cerr << "client connect failed: " << err << std::endl;
+          return;
+        }
+        std::cout << "client " << client.mSock.local_endpoint() << " stopped"
+                  << std::endl;
+      });
+    }
+
+    else {
+      std::cout << "unknown command: " << line << std::endl;
+    }
+  }
+
+  ioctx.stop();
   for (auto& thread : threads)
     thread.join();
 }
