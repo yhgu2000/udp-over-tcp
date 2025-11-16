@@ -18,6 +18,7 @@ Checks: "-*\
   ,-readability-braces-around-statements\
   ,-readability-identifier-length\
   ,-readability-implicit-bool-conversion\
+  ,-readability-isolate-declaration\
   ,-readability-magic-numbers\
   ,-readability-qualified-auto\
   ,-readability-redundant-access-specifiers"

@@ -6,6 +6,7 @@
 #include <boost/asio.hpp>
 #include <boost/system/result.hpp>
 #include <chrono>
+#include <forward_list>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -100,8 +101,8 @@ private:
       BoostEC ec;
       mSock.shutdown(Tcp::socket::shutdown_send, ec);
       if (ec)
-        std::cerr << "session " << mSock.remote_endpoint()
-                  << " shutdown failed: " << ec.message() << '\n';
+        std::cerr << "session " << this << " shutdown failed: " << ec.message()
+                  << '\n';
       auto err = do_close();
       if (!err.empty())
         std::cerr << err << '\n';
@@ -114,7 +115,7 @@ private:
                          if (ec == Ba::error::operation_aborted)
                            return;
 
-                         std::cerr << "session " << mSock.remote_endpoint()
+                         std::cerr << "session " << this
                                    << " send failed: " << ec.message() << '\n';
                          auto err = do_close();
                          if (!err.empty())
@@ -142,7 +143,7 @@ private:
             BoostEC ec;
             mSock.shutdown(Tcp::socket::shutdown_receive, ec);
             if (ec) {
-              std::cerr << "session " << mSock.remote_endpoint()
+              std::cerr << "session " << this
                         << " shutdown receive failed: " << ec.message() << '\n';
               auto err = do_close();
               if (!err.empty())
@@ -153,8 +154,8 @@ private:
             return;
           }
 
-          std::cerr << "session " << mSock.remote_endpoint()
-                    << " receive failed: " << ec.message() << '\n';
+          std::cerr << "session " << this << " receive failed: " << ec.message()
+                    << '\n';
           auto err = do_close();
           if (!err.empty())
             std::cerr << err << '\n';
@@ -298,15 +299,20 @@ protected:
 
   virtual void come(Tcp::socket&& sock)
   {
-    std::cout << "session " << sock.remote_endpoint() << " come" << std::endl;
+    auto endpoint = sock.remote_endpoint(); // 防止多线程竞争
     auto sess = new Session(*this, std::move(sock));
+
+    std::ostringstream sout;
+    sout << "session " << sess << " come: " << endpoint << '\n';
+    std::cout << sout.str() << std::flush;
     mSessions.insert(sess);
   }
 
   virtual void over(Session& sess)
   {
-    std::cout << "session " << sess.mSock.remote_endpoint() << " over"
-              << std::endl;
+    std::ostringstream sout;
+    sout << "session " << &sess << " over\n";
+    std::cout << sout.str() << std::flush;
     mSessions.erase(&sess);
     delete &sess; // 构造-析构匹配原则:
                   // Server new 的 Session, 就由 Server 去 delete
@@ -319,13 +325,13 @@ Session::do_close()
   std::stringstream errs;
   BoostEC ec;
   mSock.close(ec);
+  // 一定注意: close 后再访问 local_endpoint 或 remote_endpoint 会出错！
   if (ec)
-    errs << "session " << mSock.remote_endpoint()
-         << " close failed: " << ec.message();
+    errs << "session " << this << " close failed: " << ec.message();
   // Session 的释放必须由 Server 完成, 由于 Server 工作在不同的执行器,
   // 同样必须用 post 让它自己去主动 over.
   Ba::post(mServer.mAcpt.get_executor(), [this]() { mServer.over(*this); });
-  return std::move(errs).str();
+  return {};
 }
 
 class Client
@@ -408,9 +414,10 @@ private:
         if (ec) {
           if (ec == Ba::error::operation_aborted)
             return;
-          std::cerr << "session " << mSock.remote_endpoint()
-                    << " send failed: " << ec.message() << std::endl;
-          return stop();
+          std::cerr << "client " << this << " send failed: " << ec.message()
+                    << std::endl;
+          stop();
+          return;
         }
         do_send();
       });
@@ -425,18 +432,21 @@ private:
             return;
           if (ec == Ba::error::eof) {
             BoostEC ec;
-            mSock.shutdown(Tcp::socket::shutdown_receive, ec);
-            if (ec) {
-              std::cerr << "client " << this
-                        << " shutdown recieve failed: " << ec.message()
-                        << std::endl;
-            }
+            // mSock.shutdown(Tcp::socket::shutdown_receive, ec);
+            // if (ec) {
+            //   std::cerr << "client " << this
+            //             << " shutdown recieve failed: " << ec.message()
+            //             << std::endl;
+            // }
             mSock.close(ec);
             mGraceCb ? mGraceCb(ec ? ec.message() : "") : void(0);
+            mGraceCb = {};
+            return;
           }
-          std::cerr << "session " << mSock.remote_endpoint()
-                    << " receive failed: " << ec.message() << std::endl;
-          return stop();
+          std::cerr << "client " << this << " receive failed: " << ec.message()
+                    << std::endl;
+          stop();
+          return;
         }
         do_receive();
       });
@@ -460,64 +470,71 @@ main()
   for (auto& thread : threads)
     thread = std::thread([&]() { ioctx.run(); });
 
-  std::vector<Client> clients;
-  while (true) {
-    std::string line;
-    std::cin >> line;
-    if (line.empty())
-      break;
+  std::forward_list<Client> clients;
 
-    if (line == "s") {
-      server.audit([](const std::unordered_set<Session*>& sessions) {
-        for (auto sess : sessions) {
-          auto stat = sess->statistics();
-          std::cout << stat.mRemoteEndpoint //
-                    << ":\n  TimeEstablished = "
-                    << stat.mTimeEstablished.time_since_epoch().count() //
-                    << "\n  TimeLastActive = "
-                    << stat.mTimeLastActive.time_since_epoch().count()
-                    << "\n  AmountReceive = " << stat.mAmountReceive //
-                    << "\n  AmountSent = " << stat.mAmountSent       //
-                    << std::endl;
-        }
-      });
-    }
-
-    else if (line == "n") {
-      auto& client = clients.emplace_back(ioctx.get_executor());
-      client.start({ localhost, 12345 }, [&](std::string err) {
-        if (!err.empty()) {
-          std::cout << "client connect failed: " << err << std::endl;
-          return;
-        }
-        std::cout << "client " << client.mSock.local_endpoint() << " started"
+  auto _op_show = [&]() {
+    server.audit([](const std::unordered_set<Session*>& sessions) {
+      for (auto sess : sessions) {
+        auto stat = sess->statistics();
+        std::cout << stat.mRemoteEndpoint //
+                  << ":\n  TimeEstablished = "
+                  << stat.mTimeEstablished.time_since_epoch().count() //
+                  << "\n  TimeLastActive = "
+                  << stat.mTimeLastActive.time_since_epoch().count()
+                  << "\n  AmountReceive = " << stat.mAmountReceive //
+                  << "\n  AmountSent = " << stat.mAmountSent       //
                   << std::endl;
-      });
-    }
-
-    else if (line == "d") {
-      for (auto it = clients.rbegin(), itEnd = clients.rend(); it != itEnd;
-           ++it) {
-        if (it->mSock.is_open())
-          break;
-        clients.pop_back();
       }
+    });
+  };
 
-      auto& client = clients.back();
-      client.stop([&](std::string err) {
-        if (!err.empty()) {
-          std::cerr << "client connect failed: " << err << std::endl;
-          return;
-        }
-        std::cout << "client " << client.mSock.local_endpoint() << " stopped"
-                  << std::endl;
-      });
+  auto _op_new = [&]() {
+    auto& client = clients.emplace_front(ioctx.get_executor());
+    client.start({ localhost, 12345 }, [&](std::string err) {
+      if (!err.empty()) {
+        std::cout << "client start failed: " << err << std::endl;
+        return;
+      }
+      std::ostringstream sout;
+      sout << "client " << &client
+           << " started: " << client.mSock.local_endpoint() << '\n';
+      std::cout << sout.str() << std::flush;
+    });
+  };
+
+  auto _op_del = [&]() {
+    auto it = clients.before_begin(), itEnd = clients.end();
+    decltype(it) itNext;
+    while ((itNext = std::next(it)) != itEnd) {
+      if (it->mSock.is_open())
+        break;
+      clients.erase_after(it);
     }
 
-    else {
-      std::cout << "unknown command: " << line << std::endl;
-    }
-  }
+    auto& client = *itNext;
+    client.over([&](std::string err) {
+      std::ostringstream sout;
+      sout << "client " << &client << " over: " << err << '\n';
+      std::cout << sout.str() << std::flush;
+    });
+  };
+
+  std::cout << __LINE__ << std::endl, _op_show();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::cout << __LINE__ << std::endl, _op_new();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::cout << __LINE__ << std::endl, _op_show();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::cout << __LINE__ << std::endl, _op_show();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::cout << __LINE__ << std::endl, _op_new();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::cout << __LINE__ << std::endl, _op_show();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::cout << __LINE__ << std::endl, _op_del();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::cout << __LINE__ << std::endl, _op_del();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   ioctx.stop();
   for (auto& thread : threads)
